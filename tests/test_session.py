@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from unittest.mock import MagicMock, patch
+import time
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 
@@ -14,8 +15,10 @@ from nova_sonic.session import (
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_VOICE_ID,
     INPUT_SAMPLE_RATE,
+    MAX_HISTORY_TURNS,
     MODEL_ID,
     OUTPUT_SAMPLE_RATE,
+    ConversationTurn,
     NovaSonicConfig,
     NovaSonicSession,
     SessionMetrics,
@@ -59,6 +62,18 @@ class TestSessionMetrics:
         assert metrics.audio_chunks_received == 0
         assert metrics.turns_completed == 0
         assert metrics.reconnections == 0
+
+
+class TestConversationTurn:
+    def test_creation(self):
+        turn = ConversationTurn(role="user", text="hello", timestamp=1234.0)
+        assert turn.role == "user"
+        assert turn.text == "hello"
+        assert turn.timestamp == 1234.0
+
+    def test_default_timestamp(self):
+        turn = ConversationTurn(role="assistant", text="hi")
+        assert turn.timestamp == 0.0
 
 
 class TestSessionState:
@@ -170,20 +185,23 @@ class TestResponseParsing:
 
 
 class TestSessionLifecycle:
-    def test_stop_when_idle(self):
+    @pytest.mark.asyncio
+    async def test_stop_when_idle(self):
         session = NovaSonicSession()
-        asyncio.get_event_loop().run_until_complete(session.stop())
+        await session.stop()
         assert session.state == SessionState.IDLE
 
-    def test_stop_when_already_closed(self):
+    @pytest.mark.asyncio
+    async def test_stop_when_already_closed(self):
         session = NovaSonicSession()
         session._state = SessionState.CLOSED
-        asyncio.get_event_loop().run_until_complete(session.stop())
+        await session.stop()
         assert session.state == SessionState.CLOSED
 
-    def test_send_audio_when_not_active(self):
+    @pytest.mark.asyncio
+    async def test_send_audio_when_not_active(self):
         session = NovaSonicSession()
-        asyncio.get_event_loop().run_until_complete(session.send_audio(b"\x00" * 100))
+        await session.send_audio(b"\x00" * 100)
         assert session.metrics.audio_chunks_sent == 0
 
     def test_metrics_increment(self):
@@ -196,3 +214,133 @@ class TestSessionLifecycle:
         assert metrics.audio_chunks_received == 5
         assert metrics.events_received == 10
         assert metrics.turns_completed == 2
+
+
+class TestConversationHistory:
+    """Test conversation history tracking and session continuation."""
+
+    def test_empty_history_initially(self):
+        session = NovaSonicSession()
+        assert session.history == []
+
+    def test_history_returns_copy(self):
+        session = NovaSonicSession()
+        session._history.append(ConversationTurn(role="user", text="hi"))
+        h = session.history
+        h.append(ConversationTurn(role="assistant", text="extra"))
+        assert len(session.history) == 1  # Original unchanged
+
+    def test_flush_user_turn(self):
+        session = NovaSonicSession()
+        session._current_user_text = "Hello there"
+        session._flush_current_turn()
+        assert len(session._history) == 1
+        assert session._history[0].role == "user"
+        assert session._history[0].text == "Hello there"
+        assert session._current_user_text == ""
+
+    def test_flush_assistant_turn(self):
+        session = NovaSonicSession()
+        session._current_assistant_text = "Hi! How can I help?"
+        session._flush_current_turn()
+        assert len(session._history) == 1
+        assert session._history[0].role == "assistant"
+        assert session._history[0].text == "Hi! How can I help?"
+        assert session._current_assistant_text == ""
+
+    def test_flush_both_turns(self):
+        session = NovaSonicSession()
+        session._current_user_text = "Hello"
+        session._current_assistant_text = "Hi there"
+        session._flush_current_turn()
+        assert len(session._history) == 2
+        assert session._history[0].role == "user"
+        assert session._history[1].role == "assistant"
+
+    def test_flush_ignores_empty_text(self):
+        session = NovaSonicSession()
+        session._current_user_text = ""
+        session._current_assistant_text = "  "
+        session._flush_current_turn()
+        assert len(session._history) == 0
+
+    def test_flush_trims_whitespace(self):
+        session = NovaSonicSession()
+        session._current_user_text = "  hello  "
+        session._flush_current_turn()
+        assert session._history[0].text == "hello"
+
+    def test_history_trimmed_to_max(self):
+        session = NovaSonicSession()
+        # Fill with more than MAX_HISTORY_TURNS * 2
+        for i in range(MAX_HISTORY_TURNS * 3):
+            session._history.append(ConversationTurn(role="user", text=f"msg {i}"))
+        session._current_user_text = "overflow"
+        session._flush_current_turn()
+        assert len(session._history) <= MAX_HISTORY_TURNS * 2
+
+    def test_continuation_prompt_no_history(self):
+        session = NovaSonicSession()
+        prompt = session._build_continuation_prompt()
+        assert prompt == session.config.system_prompt
+
+    def test_continuation_prompt_with_history(self):
+        session = NovaSonicSession()
+        session._history.append(ConversationTurn(role="user", text="What is Python?"))
+        session._history.append(ConversationTurn(
+            role="assistant",
+            text="Python is a programming language.",
+        ))
+        prompt = session._build_continuation_prompt()
+        assert "What is Python?" in prompt
+        assert "Python is a programming language." in prompt
+        assert "Session continuation" in prompt
+        assert session.config.system_prompt in prompt
+
+    def test_continuation_prompt_limits_to_recent(self):
+        session = NovaSonicSession()
+        for i in range(MAX_HISTORY_TURNS + 5):
+            session._history.append(ConversationTurn(role="user", text=f"msg {i}"))
+        prompt = session._build_continuation_prompt()
+        # Should only include the last MAX_HISTORY_TURNS entries
+        assert f"msg {MAX_HISTORY_TURNS + 4}" in prompt
+        assert "msg 0" not in prompt
+
+
+class TestCallbacks:
+    def test_on_text_callback_stored(self):
+        cb = MagicMock()
+        session = NovaSonicSession(on_text=cb)
+        assert session._on_text is cb
+
+    def test_on_audio_callback_stored(self):
+        cb = MagicMock()
+        session = NovaSonicSession(on_audio=cb)
+        assert session._on_audio is cb
+
+    def test_on_reconnect_callback_stored(self):
+        cb = MagicMock()
+        session = NovaSonicSession(on_reconnect=cb)
+        assert session._on_reconnect is cb
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_wrong_state(self):
+        session = NovaSonicSession()
+        session._state = SessionState.ACTIVE
+        await session.start()
+        # Should stay in ACTIVE, not attempt to reconnect
+        assert session.state == SessionState.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_reconnect_rejects_wrong_state(self):
+        session = NovaSonicSession()
+        # IDLE state cannot reconnect
+        await session.reconnect()
+        assert session.state == SessionState.IDLE
+
+
+class TestReconnectEvent:
+    def test_reconnect_event_exists(self):
+        session = NovaSonicSession()
+        assert isinstance(session.reconnect_event, asyncio.Event)
+        assert not session.reconnect_event.is_set()

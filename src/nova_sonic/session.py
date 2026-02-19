@@ -58,6 +58,9 @@ CHUNK_SIZE = 1024            # Samples per chunk
 SESSION_TIMEOUT_SECONDS = 7 * 60  # Reconnect before 8-min limit
 SILENCE_AFTER_SPEECH_SECONDS = 2  # Silence to send after speech for turn detection
 
+# Conversation history for session continuation
+MAX_HISTORY_TURNS = 10  # Keep last N exchanges for context replay
+
 # Default voice
 DEFAULT_VOICE_ID = "matthew"
 
@@ -101,16 +104,26 @@ class SessionMetrics:
     reconnections: int = 0
 
 
+@dataclass
+class ConversationTurn:
+    """A single turn in the conversation history."""
+    role: str       # "user" or "assistant"
+    text: str       # Transcript text
+    timestamp: float = 0.0
+
+
 # Callback types
 TextCallback = Callable[[str, str], None]  # (role, text) -> None
 AudioCallback = Callable[[bytes], None]    # (audio_bytes) -> None
+ReconnectCallback = Callable[[], None]     # () -> None (called on reconnect)
 
 
 class NovaSonicSession:
     """A single Nova Sonic bidirectional streaming session.
 
     Manages the WebSocket connection, event protocol, and audio I/O.
-    Designed to be composed into higher-level managers.
+    Supports automatic session continuation at the 8-minute boundary
+    by tracking conversation history and replaying it on reconnect.
 
     Example::
 
@@ -126,10 +139,12 @@ class NovaSonicSession:
         config: NovaSonicConfig | None = None,
         on_text: TextCallback | None = None,
         on_audio: AudioCallback | None = None,
+        on_reconnect: ReconnectCallback | None = None,
     ):
         self.config = config or NovaSonicConfig()
         self._on_text = on_text
         self._on_audio = on_audio
+        self._on_reconnect = on_reconnect
 
         # Connection state
         self._client: BedrockRuntimeClient | None = None
@@ -145,9 +160,18 @@ class NovaSonicSession:
         # Audio queues
         self._audio_output_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
+        # Conversation history for session continuation
+        self._history: list[ConversationTurn] = []
+        self._current_user_text = ""
+        self._current_assistant_text = ""
+
         # Task handles
         self._response_task: asyncio.Task | None = None
         self._session_timer_task: asyncio.Task | None = None
+
+        # Session continuation control
+        self._should_reconnect = False
+        self._reconnect_event = asyncio.Event()
 
     @property
     def state(self) -> SessionState:
@@ -166,6 +190,16 @@ class NovaSonicSession:
         """Queue of audio bytes to play. Consumers can drain this."""
         return self._audio_output_queue
 
+    @property
+    def history(self) -> list[ConversationTurn]:
+        """Conversation history across all session segments."""
+        return list(self._history)
+
+    @property
+    def reconnect_event(self) -> asyncio.Event:
+        """Set when a reconnect is triggered. Cleared after reconnect completes."""
+        return self._reconnect_event
+
     def _init_client(self) -> None:
         """Initialize the Bedrock client with SigV4 auth."""
         config = Config(
@@ -178,6 +212,27 @@ class NovaSonicSession:
         self._client = BedrockRuntimeClient(config=config)
         logger.info("Bedrock client initialized (region=%s)", self.config.region)
 
+    def _build_continuation_prompt(self) -> str:
+        """Build a system prompt that includes conversation history for continuity."""
+        if not self._history:
+            return self.config.system_prompt
+
+        # Build a conversation summary from recent turns
+        recent = self._history[-MAX_HISTORY_TURNS:]
+        history_lines = []
+        for turn in recent:
+            label = "User" if turn.role == "user" else "Assistant"
+            history_lines.append(f"{label}: {turn.text}")
+
+        history_text = "\n".join(history_lines)
+
+        return (
+            f"{self.config.system_prompt}\n\n"
+            f"[Session continuation] The conversation so far:\n{history_text}\n\n"
+            f"Continue the conversation naturally from where it left off. "
+            f"Do not repeat previous responses or acknowledge the reconnection."
+        )
+
     async def _send_event(self, event_dict: dict) -> None:
         """Send a JSON event to the stream."""
         event_json = json.dumps(event_dict)
@@ -186,18 +241,9 @@ class NovaSonicSession:
         )
         await self._stream.input_stream.send(event)
 
-    async def start(self) -> None:
-        """Open the stream and set up the session."""
-        if self._state not in (SessionState.IDLE, SessionState.CLOSED):
-            logger.warning("Cannot start session in state %s", self._state.value)
-            return
-
-        self._state = SessionState.CONNECTING
-
-        if not self._client:
-            self._init_client()
-
-        # Fresh UUIDs for this session
+    async def _open_stream(self, system_prompt: str) -> None:
+        """Open a new stream and send the setup events."""
+        # Fresh UUIDs for this session segment
         self._prompt_name = str(uuid.uuid4())
         self._system_content_name = str(uuid.uuid4())
         self._audio_content_name = str(uuid.uuid4())
@@ -239,7 +285,7 @@ class NovaSonicSession:
             }
         })
 
-        # 3. System prompt
+        # 3. System prompt (with history on reconnect)
         await self._send_event({
             "event": {
                 "contentStart": {
@@ -257,7 +303,7 @@ class NovaSonicSession:
                 "textInput": {
                     "promptName": self._prompt_name,
                     "contentName": self._system_content_name,
-                    "content": self.config.system_prompt,
+                    "content": system_prompt,
                 }
             }
         })
@@ -291,6 +337,21 @@ class NovaSonicSession:
             }
         })
 
+        logger.info("Stream opened (prompt=%s)", self._prompt_name[:8])
+
+    async def start(self) -> None:
+        """Open the stream and set up the session."""
+        if self._state not in (SessionState.IDLE, SessionState.CLOSED):
+            logger.warning("Cannot start session in state %s", self._state.value)
+            return
+
+        self._state = SessionState.CONNECTING
+
+        if not self._client:
+            self._init_client()
+
+        await self._open_stream(self.config.system_prompt)
+
         self._state = SessionState.ACTIVE
         self._metrics.session_start_time = time.time()
 
@@ -300,7 +361,84 @@ class NovaSonicSession:
         # Start session timer for 8-min reconnect
         self._session_timer_task = asyncio.create_task(self._session_timer())
 
-        logger.info("Session started (prompt=%s)", self._prompt_name[:8])
+        logger.info("Session started")
+
+    async def reconnect(self) -> None:
+        """Reconnect with conversation context for session continuation.
+
+        Closes the current stream and opens a new one with conversation
+        history injected into the system prompt, so the model can continue
+        the conversation naturally.
+        """
+        if self._state not in (SessionState.ACTIVE, SessionState.RECONNECTING):
+            logger.warning("Cannot reconnect in state %s", self._state.value)
+            return
+
+        self._state = SessionState.RECONNECTING
+        logger.info(
+            "Reconnecting (turns=%d, history=%d entries)...",
+            self._metrics.turns_completed,
+            len(self._history),
+        )
+
+        # Flush any partial turn text into history
+        self._flush_current_turn()
+
+        # Cancel old tasks
+        for task in [self._response_task, self._session_timer_task]:
+            if task and not task.done():
+                task.cancel()
+
+        if self._response_task:
+            try:
+                await asyncio.wait_for(self._response_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        # Close old stream gracefully
+        try:
+            await self._send_event({
+                "event": {
+                    "contentEnd": {
+                        "promptName": self._prompt_name,
+                        "contentName": self._audio_content_name,
+                    }
+                }
+            })
+            await self._send_event({
+                "event": {"promptEnd": {"promptName": self._prompt_name}}
+            })
+            await self._send_event({
+                "event": {"sessionEnd": {}}
+            })
+            await self._stream.input_stream.close()
+        except Exception:
+            logger.debug("Error closing old stream during reconnect", exc_info=True)
+
+        # Open new stream with conversation context
+        continuation_prompt = self._build_continuation_prompt()
+        await self._open_stream(continuation_prompt)
+
+        self._state = SessionState.ACTIVE
+        self._metrics.session_start_time = time.time()
+        self._metrics.reconnections += 1
+
+        # Start new response processor and timer
+        self._response_task = asyncio.create_task(self._process_responses())
+        self._session_timer_task = asyncio.create_task(self._session_timer())
+
+        # Notify consumers
+        self._reconnect_event.set()
+        self._reconnect_event.clear()
+
+        if self._on_reconnect:
+            self._on_reconnect()
+
+        logger.info(
+            "Reconnected (segment #%d, history=%d turns)",
+            self._metrics.reconnections + 1,
+            len(self._history),
+        )
 
     async def send_audio(self, pcm_data: bytes) -> None:
         """Send a chunk of 16kHz/16bit/mono PCM audio to Nova."""
@@ -324,8 +462,12 @@ class NovaSonicSession:
         if self._state in (SessionState.IDLE, SessionState.CLOSING, SessionState.CLOSED):
             return
 
+        self._should_reconnect = False
         self._state = SessionState.CLOSING
         logger.info("Closing session...")
+
+        # Flush any partial turn
+        self._flush_current_turn()
 
         # Cancel tasks
         for task in [self._response_task, self._session_timer_task]:
@@ -360,12 +502,35 @@ class NovaSonicSession:
 
         self._state = SessionState.CLOSED
         logger.info(
-            "Session closed (events=%d, sent=%d, received=%d, turns=%d)",
+            "Session closed (events=%d, sent=%d, received=%d, turns=%d, reconnects=%d)",
             self._metrics.events_received,
             self._metrics.audio_chunks_sent,
             self._metrics.audio_chunks_received,
             self._metrics.turns_completed,
+            self._metrics.reconnections,
         )
+
+    def _flush_current_turn(self) -> None:
+        """Save any accumulated partial turn text to history."""
+        if self._current_user_text.strip():
+            self._history.append(ConversationTurn(
+                role="user",
+                text=self._current_user_text.strip(),
+                timestamp=time.time(),
+            ))
+            self._current_user_text = ""
+
+        if self._current_assistant_text.strip():
+            self._history.append(ConversationTurn(
+                role="assistant",
+                text=self._current_assistant_text.strip(),
+                timestamp=time.time(),
+            ))
+            self._current_assistant_text = ""
+
+        # Trim history to max length
+        if len(self._history) > MAX_HISTORY_TURNS * 2:
+            self._history = self._history[-MAX_HISTORY_TURNS * 2:]
 
     async def _process_responses(self) -> None:
         """Listen for and route events from Nova Sonic."""
@@ -402,10 +567,12 @@ class NovaSonicSession:
                     text = event["textOutput"]["content"]
                     if role == "ASSISTANT" and display_text:
                         logger.info("Assistant: %s", text[:200])
+                        self._current_assistant_text += text
                         if self._on_text:
                             self._on_text("assistant", text)
                     elif role == "USER":
                         logger.info("User: %s", text[:200])
+                        self._current_user_text += text
                         if self._on_text:
                             self._on_text("user", text)
 
@@ -419,6 +586,8 @@ class NovaSonicSession:
 
                 elif "completionEnd" in event:
                     self._metrics.turns_completed += 1
+                    # Flush the completed turn to history
+                    self._flush_current_turn()
                     logger.info("Turn %d complete", self._metrics.turns_completed)
 
                 elif "usageEvent" in event:
@@ -438,10 +607,12 @@ class NovaSonicSession:
             await asyncio.sleep(SESSION_TIMEOUT_SECONDS)
             if self.is_active:
                 logger.info(
-                    "Session timeout (%.0fs elapsed)",
+                    "Session timeout approaching (%.0fs elapsed), reconnecting...",
                     time.time() - self._metrics.session_start_time,
                 )
-                # TODO: Implement session continuation (reconnect with context)
-                self._metrics.reconnections += 1
+                self._should_reconnect = True
+                await self.reconnect()
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.exception("Session timer error during reconnect")
