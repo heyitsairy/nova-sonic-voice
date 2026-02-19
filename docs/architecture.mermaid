@@ -1,0 +1,45 @@
+%%{init: {'theme': 'dark', 'themeVariables': {'primaryColor': '#4a90d9', 'primaryBorderColor': '#6db3f2', 'primaryTextColor': '#e8e8e8', 'lineColor': '#6db3f2', 'secondaryColor': '#2d5986', 'tertiaryColor': '#1a3a5c'}}}%%
+graph TB
+    subgraph Breeze["🖥️ Breeze (Host Machine)"]
+        subgraph Standalone["Standalone Mode"]
+            MIC["🎤 C920 Mic<br/>16kHz mono"]
+            SPK["🔊 BT Speaker<br/>24kHz mono"]
+            AGENT["NovaSonicVoiceAgent<br/>Mic capture + Playback"]
+        end
+
+        subgraph Discord_Mode["Discord Mode"]
+            DVC["🎧 Discord Voice<br/>48kHz stereo"]
+            BRIDGE["NovaSonicBridge<br/>Format conversion<br/>Multi-user tracking"]
+            SINK["NovaSonicAudioSink<br/>Discord → Nova"]
+            SOURCE["NovaSonicAudioSource<br/>Nova → Discord"]
+            THREAD["📝 Text Thread<br/>Real-time transcript"]
+        end
+
+        SESSION["NovaSonicSession<br/>WebSocket protocol<br/>Event routing<br/>Session continuation"]
+    end
+
+    subgraph AWS["☁️ AWS Bedrock"]
+        NOVA["Nova 2 Sonic<br/>amazon.nova-2-sonic-v1:0<br/>Bidirectional WebSocket"]
+    end
+
+    MIC -->|"PCM 16kHz"| AGENT
+    AGENT -->|"base64 LPCM"| SESSION
+    SESSION -->|"audio + text"| AGENT
+    AGENT -->|"PCM 24kHz"| SPK
+
+    DVC -->|"48kHz stereo"| SINK
+    SINK -->|"stereo→mono<br/>48k→16k"| BRIDGE
+    BRIDGE -->|"base64 LPCM"| SESSION
+    SESSION -->|"audio + text"| BRIDGE
+    BRIDGE -->|"mono→stereo<br/>24k→48k"| SOURCE
+    SOURCE -->|"48kHz stereo"| DVC
+    BRIDGE -->|"transcript"| THREAD
+
+    SESSION <-->|"SigV4 WebSocket<br/>Bidirectional stream"| NOVA
+
+    style Breeze fill:#1a1a2e,stroke:#4a90d9,color:#e8e8e8
+    style Standalone fill:#16213e,stroke:#4a90d9,color:#e8e8e8
+    style Discord_Mode fill:#16213e,stroke:#4a90d9,color:#e8e8e8
+    style AWS fill:#0f3460,stroke:#e94560,color:#e8e8e8
+    style SESSION fill:#4a90d9,stroke:#6db3f2,color:#fff
+    style NOVA fill:#e94560,stroke:#ff6b81,color:#fff
