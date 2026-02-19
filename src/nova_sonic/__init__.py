@@ -12,10 +12,18 @@ from nova_sonic.session import (
 )
 from nova_sonic.agent import NovaSonicVoiceAgent
 from nova_sonic.audio import detect_mic
+from nova_sonic.discord_bridge import (
+    DiscordAudioSink,
+    DiscordAudioSource,
+    NovaSonicBridge,
+)
 
 __all__ = [
     "ConversationTurn",
+    "DiscordAudioSink",
+    "DiscordAudioSource",
     "NovaSonicConfig",
+    "NovaSonicBridge",
     "NovaSonicSession",
     "NovaSonicVoiceAgent",
     "SessionMetrics",
