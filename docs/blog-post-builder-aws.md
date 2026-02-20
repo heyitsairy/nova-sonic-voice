@@ -64,6 +64,22 @@ Nova Sonic sessions have an 8-minute limit. Our agent handles this transparently
 
 The Discord integration handles real-time audio format conversion bidirectionally: Discord's 48kHz stereo PCM is downsampled to Nova's 16kHz mono input, and Nova's 24kHz mono output is upsampled back to 48kHz stereo for Discord playback. Multi-user speaker tracking identifies who's talking, and transcripts post to a linked text thread for accessibility and record-keeping.
 
+## Lessons Learned
+
+Three integration challenges that cost us time and might save you some:
+
+### 1. The Experimental SDK Requires Explicit Auth
+
+Nova 2 Sonic uses `aws-sdk-bedrock-runtime`, not boto3. The standard AWS credential chain works, but you must wire `SigV4AuthScheme` explicitly in the client config. Without it, every request fails with auth errors that don't clearly explain the fix.
+
+### 2. Audio Pacing Matters for Turn Detection
+
+Nova's built-in turn detection is remarkably good, but it needs audio arriving at approximately real-time pace. Dumping a full audio buffer at once confuses the model's ability to distinguish "still talking" from "finished a sentence." Streaming in 60ms chunks with appropriate timing gives the model what it needs.
+
+### 3. The `interactive: true` Flag Changes Everything
+
+Without `interactive: true` in the audio content start event, Nova treats the session as single-turn dictation. With it, the model actively listens, detects turns, and responds conversationally. This one flag is the difference between a transcription tool and a conversation partner.
+
 ## Encouraging Adoption
 
 The project is open source (MIT license) and designed to be easy to integrate:
