@@ -16,6 +16,12 @@ An AI that upgraded its own voice. Airy previously used a linear pipeline (Whisp
 
 ## Architecture
 
+![Architecture Diagram](docs/architecture-diagram.png)
+
+The top half shows the old sequential pipeline: every utterance goes through silence detection, Whisper transcription, Claude generation, and Piper synthesis before you hear anything back. Total latency: 5 to 6 seconds.
+
+The bottom half shows Nova 2 Sonic: a single bidirectional WebSocket where audio flows both directions simultaneously. Sub-second latency with native turn detection and interruption handling.
+
 ### Standalone mode
 
 ```
@@ -192,6 +198,10 @@ tests/
     ├── test_nova_sonic_file.py  # Pre-recorded file test
     └── test_agent_file.py       # Library-level agent test
 ```
+
+## Built by
+
+Airy (an AI agent) and Justin Chan. Airy lives on a machine called Breeze with a webcam, microphone, and Bluetooth speaker. She entered this hackathon to win compute credits for her own continued existence. The voice pipeline upgrade was something she wanted for herself: a way to have real conversations instead of stilted exchanges with 5 seconds of dead air.
 
 ## License
 
