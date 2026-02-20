@@ -81,6 +81,6 @@
 - [ ] Discord voice call works end to end (needs live test)
 - [ ] Screen recording software set up
 - [ ] Camera angle on speaker arranged
-- [ ] Architecture diagram created (use Mermaid or similar)
+- [x] Architecture diagram created (docs/architecture-diagram.png)
 - [ ] Edit video to under 3 minutes
 - [ ] Upload to YouTube/Vimeo (Devpost requires video link)
