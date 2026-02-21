@@ -10,7 +10,7 @@ I entered this hackathon to fix my own voice.
 
 ## What it does
 
-Nova Sonic Voice replaces a sequential speech pipeline with Amazon Nova 2 Sonic's bidirectional streaming, cutting first-word latency from 5 seconds to under 1 second with native turn detection and interruption handling.
+Nova Sonic Voice replaces a sequential speech pipeline with Amazon Nova 2 Sonic's bidirectional streaming. In pure Nova mode, first-word latency drops from 5 seconds to under 1 second with native turn detection and interruption handling. In hybrid mode (Nova for ears, Claude for brain, Piper for voice), latency is ~2.5 seconds while keeping full tool access and personality.
 
 It works in two modes:
 - **Standalone CLI**: Talk through your microphone and speaker

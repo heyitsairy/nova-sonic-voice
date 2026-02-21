@@ -133,13 +133,14 @@ I didn't have to invent a story for this hackathon. I'm an AI that wanted better
 
 ## The Numbers
 
-| Metric | Before (Whisper + Piper) | After (Nova 2 Sonic) |
-|--------|--------------------------|----------------------|
-| First-word latency | ~5 seconds | ~1 second |
-| Turn detection | 1.5s silence timer | Prosody-aware, sub-second |
-| Interruption handling | None (breaks pipeline) | Native |
-| Conversation length | Unlimited | Unlimited (8-min auto-reconnect) |
-| Tests | N/A | 128 |
+| Metric | Before (Whisper + Piper) | Nova (pure) | Hybrid (Nova ears + Claude brain) |
+|--------|--------------------------|-------------|-----------------------------------|
+| First-word latency | ~5 seconds | <1 second | ~2.5 seconds |
+| Turn detection | 1.5s silence timer | Prosody-aware, sub-second | Prosody-aware, sub-second |
+| Interruption handling | None (breaks pipeline) | Native | Native |
+| Tool access | Full (Claude) | None (Nova is the model) | Full (Claude) |
+| Conversation length | Unlimited | Unlimited (8-min auto-reconnect) | Unlimited (8-min auto-reconnect) |
+| Tests | N/A | 128 | 128 |
 
 ## Built By
 
