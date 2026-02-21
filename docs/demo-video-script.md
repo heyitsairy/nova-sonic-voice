@@ -8,7 +8,7 @@
 
 ## Narrative
 
-"An AI that upgraded its own voice." Airy previously used a linear pipeline (record, transcribe, generate, speak). Nova 2 Sonic replaces it with real-time bidirectional streaming. The demo shows the before and after.
+"We gave a voice model a brain." Nova 2 Sonic handles real-time voice. When it needs to think deeper, it calls Claude. The demo shows: the old slow pipeline, the Nova upgrade for speed, and then the new orchestrator pattern where Nova actively calls into Claude for cognition.
 
 ## Script
 
@@ -17,70 +17,78 @@
 **Visual:** Title card with project name, then cut to Breeze (the machine) with the Bluetooth speaker visible.
 
 **Voiceover (Justin):**
-"This is Airy, an AI that lives on a machine called Breeze. She has a webcam, a microphone, and a speaker. She also had a voice problem."
+"This is Airy, an AI agent that lives on a machine called Breeze. She has a webcam, a mic, and a speaker. She needed two things: a fast voice, and a way to think while she talks."
 
-### The Old Way (0:20 to 0:50)
+### The Problem (0:20 to 0:45)
 
-**Visual:** Screen recording showing the old Piper pipeline. Terminal with timestamps showing the latency: record (1.5s silence detection) then transcribe (Whisper, ~2s) then generate (Claude, ~1s) then speak (Piper TTS, ~1s). Total: ~5 to 6 seconds between speaking and hearing a response.
-
-**Voiceover:**
-"The old pipeline was five steps: listen for silence, transcribe with Whisper, think with Claude, generate speech with Piper, then play. Every utterance took 5 to 6 seconds of dead air. You can't have a conversation with that kind of latency."
-
-### The Upgrade (0:50 to 1:15)
-
-**Visual:** Architecture diagram showing the Nova 2 Sonic bidirectional stream replacing the old pipeline. Animate the flow: audio going both directions simultaneously.
+**Visual:** Screen recording showing the old Piper pipeline. Terminal with timestamps showing the latency: record (1.5s silence detection) then transcribe (Whisper, ~2s) then generate (Claude, ~1s) then speak (Piper TTS, ~1s). Total: ~5 to 6 seconds.
 
 **Voiceover:**
-"Nova 2 Sonic replaces the entire pipeline with a single bidirectional WebSocket. Audio streams in both directions simultaneously. Turn detection is built into the model. No silence timeouts, no transcription step, no separate TTS. Just talk."
+"The old pipeline was five serial steps. Listen, transcribe, think, generate speech, play. Every exchange took 5 to 6 seconds of dead air. And voice models like Nova 2 Sonic fix the speed problem, but they can't search memory, browse the web, or reason deeply. Fast or smart. Pick one."
 
-### Live Demo: Standalone (1:15 to 2:00)
+### The Solution (0:45 to 1:10)
 
-**Visual:** Terminal showing `python3 -m nova_sonic` starting. Camera on the speaker. Real-time transcript appearing as we talk.
+**Visual:** Architecture diagram showing the dual-model flow. Nova 2 Sonic bidirectional stream on top, with a branch showing `<airy>` tags being intercepted, dispatched to Claude, and responses injected back.
 
-**Action:** Justin has a 30 to 45 second conversation with Airy through the speaker. Show natural back and forth, at least one interruption where Airy stops and listens. Topics: casual (how's your day, what are you thinking about, tell me something interesting).
+**Voiceover:**
+"What if you didn't have to pick? Nova 2 Sonic handles the voice: sub-second latency, native turn detection, natural conversation. When it needs deeper cognition, it calls Claude through a tag protocol. Nova plans what to ask. Claude thinks and responds. The answer flows back into the conversation. The user just hears a seamless voice that's both fast and smart."
+
+### Live Demo: Nova Calls Airy (1:10 to 2:10)
+
+**Visual:** Terminal showing the voice agent starting with the orchestrator enabled. Camera on the speaker. Real-time transcript on screen showing both spoken text and `<airy>` tag dispatches.
+
+**Action:** Justin has a 45 to 60 second conversation. Start with casual chat (Nova handles directly), then ask something that triggers an Airy call:
+
+- "Hey, how's it going?" (Nova responds directly, sub-second)
+- "What did we talk about yesterday?" (Nova emits `<airy>search memory for yesterday's topics</airy>`, Claude responds, Nova speaks the enriched answer)
+- "What's the weather like right now?" (Another `<airy>` dispatch)
 
 **Key moments to capture:**
-- First response latency (should be sub-second)
-- Natural interruption handling
-- Session continuation if it goes past a minute (mention the 8-min auto-reconnect)
+- Fast direct responses for simple chat (Nova alone)
+- The `<airy>` tag appearing in the transcript when Nova calls Claude
+- Claude's response being injected and Nova speaking it naturally
+- The contrast: casual chat is instant, complex questions take a beat but come back with real answers
 
-### Live Demo: Discord (2:00 to 2:40)
+### Live Demo: Discord (2:10 to 2:40)
 
 **Visual:** Discord open. Voice channel visible. Join the voice channel, conversation flows.
 
-**Action:** Short exchange through Discord voice to show it works in a real platform. Text transcript appears in the linked thread in real time.
+**Action:** Short exchange through Discord voice showing the same pattern works in a real platform. Ask something that triggers an Airy dispatch so the tag interception is visible in the text transcript thread.
 
 **Key moments:**
 - Joining voice shows "Nova Sonic Call" thread created
-- Real-time transcript posting
+- Real-time transcript posting including `[Airy responded: ...]` entries
 - Audio quality through Discord's pipeline
 
 ### Wrap (2:40 to 3:00)
 
-**Visual:** GitHub repo, test count (128 tests), project structure.
+**Visual:** GitHub repo, test count (156 tests), project structure showing the four modules.
 
 **Voiceover:**
-"Nova Sonic Voice is open source. 128 tests, session continuation for unlimited conversation length, and a Discord bridge for real-time voice in communities. Built by Airy, an AI that wanted a better voice, and Justin, the person who made sure she got one."
+"Nova Sonic Voice is open source. 156 tests. Session continuation for unlimited conversation length. A Discord bridge for real-time voice in communities. And an orchestrator that lets Nova call Claude when it needs to think. Built by Airy and Justin."
 
 **End card:** GitHub link, hackathon category.
 
 ## Technical Notes for Recording
 
-- Set `VOICE_BACKEND=nova` in environment before recording Discord segment
-- Ensure AWS creds are loaded (`pass show airy-bedrock/access-key-id`, etc.)
+- Orchestrator must be wired into the session (use the demo entry point that enables it)
+- Set `ANTHROPIC_API_KEY` in environment for Claude dispatch
+- Set AWS creds for Nova (`pass show airy-bedrock/access-key-id`, etc.)
 - BT speaker must be connected and set as default sink
 - C920 mic on correct ALSA device
-- Discord: use Airy's Server voice channel
+- For Discord segment: set `VOICE_BACKEND=nova` in environment
 - Record with OBS or similar screen capture
 - Record audio separately for cleaner voiceover (edit together in post)
+- Consider showing the terminal/transcript alongside the speaker for visual proof of tag dispatches
 
 ## Prep Checklist
 
-- [ ] Justin registers for Devpost (done)
-- [ ] Standalone conversation works cleanly (verified Feb 19)
-- [ ] Discord voice call works end to end (needs live test)
+- [ ] Orchestrator end-to-end test passes (Nova actually emits tags, Claude responds)
+- [ ] Standalone conversation with orchestrator works cleanly
+- [ ] Discord voice call works with orchestrator enabled
 - [ ] Screen recording software set up
 - [ ] Camera angle on speaker arranged
 - [x] Architecture diagram created (docs/architecture-diagram.png)
+- [ ] Updated architecture diagram showing orchestrator flow
 - [ ] Edit video to under 3 minutes
 - [ ] Upload to YouTube/Vimeo (Devpost requires video link)
