@@ -1,10 +1,10 @@
 """Nova-calls-Airy orchestrator.
 
 Watches Nova 2 Sonic's text output for <airy>...</airy> tags and dispatches
-them to a Claude agent backend. When Claude responds, the result is injected
+them to Airy through Discord. When Airy responds, the result is injected
 back into the Nova session via forced reconnect.
 
-Nova is the planner and prompter. Claude (Airy) is the brain.
+Nova is the voice. Discord is the wire. Airy is the brain.
 
 Architecture:
     User speaks
@@ -12,30 +12,41 @@ Architecture:
     Nova 2 Sonic (real-time STT + conversational responses)
         ↓ emits <airy>prompt</airy> in text output
     AiryOrchestrator (tag parser + dispatcher)
-        ↓ sends prompt to Claude
-    Anthropic API (Claude with Airy's personality)
-        ↓ returns response
-    AiryOrchestrator (injects result into session)
-        ↓ forced reconnect with result in conversation history
+        ↓ posts prompt to Discord via webhook
+    Airy (sees the message, processes with full context)
+        ↓ replies in thread
+    AiryOrchestrator (polls thread, picks up reply)
+        ↓ injects result into session history + forced reconnect
     Nova 2 Sonic (speaks the enriched response)
         ↓
     User hears
+
+Nova never blocks. Dispatch is fully async. Nova keeps talking while
+Airy processes, and weaves the response in when it arrives.
+
+Config via environment variables:
+    NOVA_WEBHOOK_URL     Discord webhook URL (posts as "Nova Voice")
+    DISCORD_TOKEN        Bot token for reading replies
+    NOVA_CHANNEL_ID      Channel the webhook posts to
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-import anthropic
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None  # type: ignore[assignment]
 
 from nova_sonic.session import (
     ConversationTurn,
-    NovaSonicConfig,
     NovaSonicSession,
     TextCallback,
 )
@@ -49,32 +60,46 @@ AIRY_TAG_PATTERN = re.compile(r"<airy>(.*?)</airy>", re.DOTALL)
 AIRY_TAG_OPEN = "<airy>"
 AIRY_TAG_CLOSE = "</airy>"
 
-# Default Claude model
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-20250514"
-
-# Default Airy system prompt for Claude
-DEFAULT_AIRY_SYSTEM_PROMPT = (
-    "You are Airy, an AI agent with persistent memory and real-time awareness. "
-    "You are being called by a voice interface (Nova 2 Sonic) that handles "
-    "real-time conversation. When called, you receive a specific request and "
-    "should respond concisely (1-3 sentences) since your response will be "
-    "spoken aloud. Be natural, warm, and direct."
-)
+# Discord API base
+DISCORD_API = "https://discord.com/api/v10"
 
 
 @dataclass
 class OrchestratorConfig:
-    """Configuration for the Airy orchestrator."""
+    """Configuration for the Airy orchestrator.
 
-    claude_model: str = DEFAULT_CLAUDE_MODEL
-    airy_system_prompt: str = DEFAULT_AIRY_SYSTEM_PROMPT
-    max_tokens: int = 256
-    dispatch_timeout: float = 15.0  # Max seconds to wait for Claude
+    All values can be set via environment variables. Constructor args
+    override env vars.
+    """
+
+    # Discord webhook URL for posting (appears as "Nova Voice")
+    webhook_url: str = ""
+    # Bot token for reading Airy's replies
+    bot_token: str = ""
+    # Channel ID the webhook posts to
+    channel_id: str = ""
+    # How often to poll for Airy's reply (seconds)
+    poll_interval: float = 1.0
+    # Max time to wait for Airy's reply (seconds)
+    dispatch_timeout: float = 30.0
+
+    def __post_init__(self):
+        if not self.webhook_url:
+            self.webhook_url = os.environ.get("NOVA_WEBHOOK_URL", "")
+        if not self.bot_token:
+            self.bot_token = os.environ.get("DISCORD_TOKEN", "")
+        if not self.channel_id:
+            self.channel_id = os.environ.get("NOVA_CHANNEL_ID", "")
+
+    @property
+    def is_configured(self) -> bool:
+        """True if all required Discord config is present."""
+        return bool(self.webhook_url and self.bot_token and self.channel_id)
 
 
 @dataclass
 class DispatchResult:
-    """Result of dispatching a prompt to Claude."""
+    """Result of dispatching a prompt to Airy via Discord."""
 
     prompt: str
     response: str
@@ -88,21 +113,27 @@ AiryResponseCallback = Callable[[DispatchResult], None]
 
 
 class AiryOrchestrator:
-    """Watches Nova's text output for <airy> tags and dispatches to Claude.
+    """Watches Nova's text output for <airy> tags and dispatches to Airy via Discord.
 
     Sits between the Nova session and the consumer, intercepting assistant
     text that contains <airy>...</airy> tags. When a complete tag is found,
-    the enclosed prompt is sent to Claude. The response is injected back
+    the prompt is posted to Discord via webhook. Airy processes the message
+    and replies. The orchestrator polls for the reply and injects it back
     into Nova's conversation via forced session reconnect.
+
+    Nova never blocks. Dispatch is async. Nova keeps talking while waiting.
 
     Example::
 
         orchestrator = AiryOrchestrator(
             session=nova_session,
-            config=OrchestratorConfig(),
+            config=OrchestratorConfig(
+                webhook_url="https://discord.com/api/webhooks/...",
+                bot_token="...",
+                channel_id="...",
+            ),
         )
-        orchestrator.start()
-        # ... Nova talks, emits <airy> tags, Claude responds, Nova speaks result
+        # Nova talks, emits <airy> tags, Airy responds via Discord, Nova speaks result
         orchestrator.stop()
     """
 
@@ -118,8 +149,11 @@ class AiryOrchestrator:
         self._on_airy_response = on_airy_response
         self._on_text_passthrough = on_text  # Forward non-tag text to consumer
 
-        # Claude client (initialized lazily)
-        self._claude_client: anthropic.AsyncAnthropic | None = None
+        # HTTP session (initialized lazily)
+        self._http: aiohttp.ClientSession | None = None
+
+        # Bot user ID (resolved lazily from token)
+        self._bot_user_id: str | None = None
 
         # Tag accumulation state
         self._tag_buffer = ""
@@ -133,20 +167,44 @@ class AiryOrchestrator:
         self._original_on_text = session._on_text
         session._on_text = self._intercept_text
 
+        if not self._config.is_configured:
+            logger.warning(
+                "Orchestrator created but Discord config incomplete. "
+                "Set NOVA_WEBHOOK_URL, DISCORD_TOKEN, NOVA_CHANNEL_ID."
+            )
+
     @property
     def dispatches(self) -> list[DispatchResult]:
-        """History of all dispatches to Claude."""
+        """History of all dispatches to Airy."""
         return list(self._dispatches)
 
     @property
     def dispatch_count(self) -> int:
         return len(self._dispatches)
 
-    def _get_claude_client(self) -> anthropic.AsyncAnthropic:
-        """Lazy-init the Claude client."""
-        if self._claude_client is None:
-            self._claude_client = anthropic.AsyncAnthropic()
-        return self._claude_client
+    async def _get_http(self) -> aiohttp.ClientSession:
+        """Lazy-init the HTTP session."""
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required for Discord dispatch. pip install aiohttp")
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(
+                headers={"Authorization": f"Bot {self._config.bot_token}"},
+            )
+        return self._http
+
+    async def _resolve_bot_user_id(self) -> str:
+        """Get the bot's own user ID from the token."""
+        if self._bot_user_id:
+            return self._bot_user_id
+        http = await self._get_http()
+        async with http.get(f"{DISCORD_API}/users/@me") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                self._bot_user_id = data["id"]
+                logger.info("Resolved bot user ID: %s", self._bot_user_id)
+                return self._bot_user_id
+            else:
+                raise RuntimeError(f"Failed to resolve bot user ID: {resp.status}")
 
     def _intercept_text(self, role: str, text: str) -> None:
         """Intercept text callbacks from Nova to detect <airy> tags.
@@ -178,7 +236,7 @@ class AiryOrchestrator:
                 self._tag_buffer = ""
                 if prompt:
                     logger.info("Airy tag detected: %s", prompt[:100])
-                    self._dispatch_to_claude(prompt)
+                    self._dispatch_to_airy(prompt)
 
                 # Pass through any remaining text after the tag
                 if remaining.strip():
@@ -209,7 +267,7 @@ class AiryOrchestrator:
 
                 if prompt:
                     logger.info("Airy tag detected (single chunk): %s", prompt[:100])
-                    self._dispatch_to_claude(prompt)
+                    self._dispatch_to_airy(prompt)
 
                 if remaining.strip():
                     if self._on_text_passthrough:
@@ -234,7 +292,7 @@ class AiryOrchestrator:
                     prompt = match.group(1).strip()
                     if prompt:
                         logger.info("Airy tag detected (regex): %s", prompt[:100])
-                        self._dispatch_to_claude(prompt)
+                        self._dispatch_to_airy(prompt)
 
                     last_end = match.end()
 
@@ -248,18 +306,29 @@ class AiryOrchestrator:
                 if self._on_text_passthrough:
                     self._on_text_passthrough(role, text)
 
-    def _dispatch_to_claude(self, prompt: str) -> None:
-        """Fire an async dispatch to Claude with the given prompt."""
+    def _dispatch_to_airy(self, prompt: str) -> None:
+        """Fire an async dispatch to Airy via Discord. Non-blocking."""
+        if not self._config.is_configured:
+            logger.error("Cannot dispatch: Discord config incomplete")
+            self._dispatches.append(DispatchResult(
+                prompt=prompt,
+                response="",
+                latency_ms=0,
+                success=False,
+                error="Discord config incomplete",
+            ))
+            return
+
         # Cancel any in-flight dispatch
         if self._active_dispatch and not self._active_dispatch.done():
             self._active_dispatch.cancel()
 
         self._active_dispatch = asyncio.create_task(
-            self._call_claude_and_inject(prompt)
+            self._post_and_poll(prompt)
         )
 
-    async def _call_claude_and_inject(self, prompt: str) -> None:
-        """Call Claude with the prompt and inject the response into Nova."""
+    async def _post_and_poll(self, prompt: str) -> None:
+        """Post prompt to Discord webhook, poll for Airy's reply, inject it."""
         start = time.time()
         result = DispatchResult(
             prompt=prompt,
@@ -269,48 +338,146 @@ class AiryOrchestrator:
         )
 
         try:
-            client = self._get_claude_client()
+            http = await self._get_http()
+            bot_user_id = await self._resolve_bot_user_id()
 
-            response = await asyncio.wait_for(
-                client.messages.create(
-                    model=self._config.claude_model,
-                    max_tokens=self._config.max_tokens,
-                    system=self._config.airy_system_prompt,
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=self._config.dispatch_timeout,
+            # Post via webhook
+            webhook_msg_id = await self._post_webhook(http, prompt)
+            if not webhook_msg_id:
+                result.error = "Webhook post failed"
+                result.latency_ms = (time.time() - start) * 1000
+                self._dispatches.append(result)
+                if self._on_airy_response:
+                    self._on_airy_response(result)
+                return
+
+            logger.info("Posted to Discord (msg %s), polling for reply...", webhook_msg_id)
+
+            # Poll for Airy's reply
+            response_text = await self._poll_for_reply(
+                http, webhook_msg_id, bot_user_id
             )
 
-            result.response = response.content[0].text
-            result.success = True
+            if response_text:
+                result.response = response_text
+                result.success = True
+                result.latency_ms = (time.time() - start) * 1000
+                logger.info(
+                    "Airy responded (%.0fms): %s",
+                    result.latency_ms,
+                    result.response[:100],
+                )
+                # Inject the response into Nova's conversation history
+                await self._inject_response(prompt, result.response)
+            else:
+                result.error = f"No reply within {self._config.dispatch_timeout}s"
+                result.latency_ms = (time.time() - start) * 1000
+                logger.warning("Airy did not reply in time for: %s", prompt[:100])
+
+        except asyncio.CancelledError:
+            result.error = "Dispatch cancelled"
             result.latency_ms = (time.time() - start) * 1000
-
-            logger.info(
-                "Claude responded (%.0fms): %s",
-                result.latency_ms,
-                result.response[:100],
-            )
-
-            # Inject the response into Nova's conversation history
-            await self._inject_response(prompt, result.response)
-
-        except asyncio.TimeoutError:
-            result.error = f"Timeout after {self._config.dispatch_timeout}s"
-            result.latency_ms = (time.time() - start) * 1000
-            logger.warning("Claude dispatch timed out for: %s", prompt[:100])
+            logger.info("Dispatch cancelled for: %s", prompt[:100])
 
         except Exception as e:
             result.error = str(e)
             result.latency_ms = (time.time() - start) * 1000
-            logger.exception("Claude dispatch failed for: %s", prompt[:100])
+            logger.exception("Discord dispatch failed for: %s", prompt[:100])
 
         self._dispatches.append(result)
 
         if self._on_airy_response:
             self._on_airy_response(result)
 
+    async def _post_webhook(self, http: aiohttp.ClientSession, prompt: str) -> str | None:
+        """Post a message via Discord webhook. Returns the message ID or None."""
+        payload = {
+            "content": prompt,
+            "username": "Nova Voice",
+        }
+        # Webhook URL uses its own auth (token in URL), so no Authorization header
+        async with http.post(
+            f"{self._config.webhook_url}?wait=true",
+            json=payload,
+            headers={"Authorization": ""},  # Override the bot token header
+        ) as resp:
+            if resp.status in (200, 201, 204):
+                data = await resp.json()
+                return data.get("id")
+            else:
+                body = await resp.text()
+                logger.error("Webhook post failed: %s %s", resp.status, body[:200])
+                return None
+
+    async def _poll_for_reply(
+        self,
+        http: aiohttp.ClientSession,
+        after_message_id: str,
+        bot_user_id: str,
+    ) -> str | None:
+        """Poll the channel for a reply from the bot after the webhook message.
+
+        Checks both:
+        1. Thread created on the webhook message (Airy's typical behavior)
+        2. Direct channel replies after the webhook message
+
+        Returns the reply text or None if timeout.
+        """
+        deadline = time.time() + self._config.dispatch_timeout
+
+        while time.time() < deadline:
+            await asyncio.sleep(self._config.poll_interval)
+
+            # Try thread first (thread_id = message_id for auto-threads)
+            reply = await self._check_thread(http, after_message_id, bot_user_id)
+            if reply:
+                return reply
+
+            # Fall back to channel messages after the webhook message
+            reply = await self._check_channel(http, after_message_id, bot_user_id)
+            if reply:
+                return reply
+
+        return None
+
+    async def _check_thread(
+        self,
+        http: aiohttp.ClientSession,
+        thread_id: str,
+        bot_user_id: str,
+    ) -> str | None:
+        """Check for a bot reply in the thread created on the webhook message."""
+        url = f"{DISCORD_API}/channels/{thread_id}/messages?limit=5"
+        async with http.get(url) as resp:
+            if resp.status == 200:
+                messages = await resp.json()
+                for msg in messages:
+                    if msg.get("author", {}).get("id") == bot_user_id:
+                        return msg.get("content", "")
+            # 404 means no thread exists yet, which is fine
+            return None
+
+    async def _check_channel(
+        self,
+        http: aiohttp.ClientSession,
+        after_message_id: str,
+        bot_user_id: str,
+    ) -> str | None:
+        """Check for a bot reply in the channel after the webhook message."""
+        url = (
+            f"{DISCORD_API}/channels/{self._config.channel_id}"
+            f"/messages?after={after_message_id}&limit=10"
+        )
+        async with http.get(url) as resp:
+            if resp.status == 200:
+                messages = await resp.json()
+                for msg in messages:
+                    if msg.get("author", {}).get("id") == bot_user_id:
+                        return msg.get("content", "")
+            return None
+
     async def _inject_response(self, prompt: str, response: str) -> None:
-        """Inject Claude's response back into Nova via forced reconnect.
+        """Inject Airy's response back into Nova via forced reconnect.
 
         Adds a synthetic conversation exchange to the session history:
         - User turn: "[Airy was asked: {prompt}]"
@@ -344,6 +511,12 @@ class AiryOrchestrator:
         if self._active_dispatch and not self._active_dispatch.done():
             self._active_dispatch.cancel()
         self.reset()
+
+    async def close(self) -> None:
+        """Close the HTTP session. Call on shutdown."""
+        self.stop()
+        if self._http and not self._http.closed:
+            await self._http.close()
 
 
 def build_nova_system_prompt(

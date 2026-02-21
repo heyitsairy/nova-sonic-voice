@@ -9,10 +9,15 @@ Usage:
     AWS_DEFAULT_REGION=us-east-1 \\
     python3 -m nova_sonic.cli
 
+    # With Airy orchestrator (Nova calls Airy through Discord):
+    NOVA_WEBHOOK_URL=... DISCORD_TOKEN=... NOVA_CHANNEL_ID=... \\
+    python3 -m nova_sonic.cli --airy
+
 Options:
     --voice VOICE_ID    Voice to use (default: matthew)
     --system PROMPT     Custom system prompt
     --duration SECS     Max conversation duration in seconds (0=unlimited)
+    --airy              Enable Airy orchestrator (Nova calls Airy via Discord)
 """
 
 from __future__ import annotations
@@ -61,12 +66,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--airy",
         action="store_true",
-        help="Enable Airy orchestrator (Nova calls Claude for deeper cognition)",
+        help="Enable Airy orchestrator (Nova calls Airy via Discord). "
+        "Requires NOVA_WEBHOOK_URL, DISCORD_TOKEN, NOVA_CHANNEL_ID env vars.",
     )
     parser.add_argument(
-        "--airy-model",
-        default="claude-sonnet-4-20250514",
-        help="Claude model for Airy dispatch (default: claude-sonnet-4-20250514)",
+        "--webhook-url",
+        default=None,
+        help="Discord webhook URL (overrides NOVA_WEBHOOK_URL env var)",
+    )
+    parser.add_argument(
+        "--channel-id",
+        default=None,
+        help="Discord channel ID (overrides NOVA_CHANNEL_ID env var)",
     )
     parser.add_argument(
         "--debug",
@@ -84,11 +95,13 @@ class ConversationDisplay:
         self._turn_count = 0
         self._start_time = 0.0
 
-    def start(self) -> None:
+    def start(self, airy_enabled: bool = False) -> None:
         self._start_time = time.time()
         print()
         print("=" * 60)
         print("  Nova 2 Sonic Voice Conversation")
+        if airy_enabled:
+            print("  [Airy orchestrator enabled via Discord]")
         print("=" * 60)
         print("  Speak naturally. Press Ctrl+C to stop.")
         print("  Session auto-continues past the 8-min limit.")
@@ -188,7 +201,7 @@ async def run(args: argparse.Namespace) -> None:
         config.system_prompt = build_nova_system_prompt(
             base_personality=args.system or "",
         )
-        logger.info("Airy orchestrator enabled (model=%s)", args.airy_model)
+        logger.info("Airy orchestrator enabled (Discord dispatch)")
     elif args.system:
         config.system_prompt = args.system
 
@@ -211,22 +224,34 @@ async def run(args: argparse.Namespace) -> None:
         loop.add_signal_handler(sig, signal_handler)
 
     # Start conversation
-    display.start()
+    display.start(airy_enabled=args.airy)
     await agent.start()
 
     # Wire up Airy orchestrator after session exists
     orchestrator = None
     if args.airy and agent.session:
-        orchestrator = AiryOrchestrator(
-            session=agent.session,
-            config=OrchestratorConfig(
-                claude_model=args.airy_model,
-                dispatch_timeout=15.0,
-            ),
-            on_airy_response=display.on_airy_dispatch,
-            on_text=display.on_assistant_text,
+        orch_config = OrchestratorConfig(
+            dispatch_timeout=30.0,
         )
-        logger.info("Airy orchestrator wired into session")
+        # CLI args override env vars
+        if args.webhook_url:
+            orch_config.webhook_url = args.webhook_url
+        if args.channel_id:
+            orch_config.channel_id = args.channel_id
+
+        if not orch_config.is_configured:
+            logger.error(
+                "Airy orchestrator requested but Discord config incomplete. "
+                "Set NOVA_WEBHOOK_URL, DISCORD_TOKEN, NOVA_CHANNEL_ID."
+            )
+        else:
+            orchestrator = AiryOrchestrator(
+                session=agent.session,
+                config=orch_config,
+                on_airy_response=display.on_airy_dispatch,
+                on_text=display.on_assistant_text,
+            )
+            logger.info("Airy orchestrator wired into session")
 
     # Wire up reconnect display
     if agent.session:
@@ -250,7 +275,7 @@ async def run(args: argparse.Namespace) -> None:
 
     # Shutdown
     if orchestrator:
-        orchestrator.stop()
+        await orchestrator.close()
         logger.info(
             "Airy orchestrator stopped (%d dispatches)",
             orchestrator.dispatch_count,

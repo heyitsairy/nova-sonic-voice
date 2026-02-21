@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +17,7 @@ from nova_sonic.orchestrator import (
     OrchestratorConfig,
     build_nova_system_prompt,
 )
-from nova_sonic.session import ConversationTurn, NovaSonicConfig, NovaSonicSession
+from nova_sonic.session import ConversationTurn, NovaSonicSession
 
 
 # --- Fixtures ---
@@ -36,7 +37,9 @@ def mock_session():
 @pytest.fixture
 def config():
     return OrchestratorConfig(
-        claude_model="claude-sonnet-4-20250514",
+        webhook_url="https://discord.com/api/webhooks/123/abc",
+        bot_token="fake-bot-token",
+        channel_id="999888777",
         dispatch_timeout=5.0,
     )
 
@@ -47,6 +50,18 @@ def orchestrator(mock_session, config):
         session=mock_session,
         config=config,
     )
+
+
+def _mock_http_response(status=200, json_data=None, text_data=""):
+    """Create a mock aiohttp response."""
+    resp = AsyncMock()
+    resp.status = status
+    resp.json = AsyncMock(return_value=json_data or {})
+    resp.text = AsyncMock(return_value=text_data)
+    # Make it work as async context manager
+    resp.__aenter__ = AsyncMock(return_value=resp)
+    resp.__aexit__ = AsyncMock(return_value=False)
+    return resp
 
 
 # --- Tag Pattern Tests ---
@@ -116,7 +131,7 @@ class TestTextInterception:
 
     def test_complete_tag_dispatches(self, orchestrator):
         """A complete <airy> tag should trigger dispatch."""
-        with patch.object(orchestrator, "_dispatch_to_claude") as mock_dispatch:
+        with patch.object(orchestrator, "_dispatch_to_airy") as mock_dispatch:
             orchestrator._intercept_text(
                 "assistant",
                 "Let me check. <airy>search memory for yesterday</airy>",
@@ -128,7 +143,7 @@ class TestTextInterception:
         received = []
         orchestrator._on_text_passthrough = lambda role, text: received.append((role, text))
 
-        with patch.object(orchestrator, "_dispatch_to_claude"):
+        with patch.object(orchestrator, "_dispatch_to_airy"):
             orchestrator._intercept_text(
                 "assistant",
                 "Let me check. <airy>search</airy>",
@@ -140,7 +155,7 @@ class TestTextInterception:
         received = []
         orchestrator._on_text_passthrough = lambda role, text: received.append((role, text))
 
-        with patch.object(orchestrator, "_dispatch_to_claude"):
+        with patch.object(orchestrator, "_dispatch_to_airy"):
             orchestrator._intercept_text(
                 "assistant",
                 "<airy>search</airy> One moment please.",
@@ -149,7 +164,7 @@ class TestTextInterception:
 
     def test_partial_tag_accumulates(self, orchestrator):
         """A tag split across chunks should accumulate."""
-        with patch.object(orchestrator, "_dispatch_to_claude") as mock_dispatch:
+        with patch.object(orchestrator, "_dispatch_to_airy") as mock_dispatch:
             # First chunk opens the tag
             orchestrator._intercept_text("assistant", "Hmm. <airy>search memory")
             assert orchestrator._in_tag is True
@@ -162,7 +177,7 @@ class TestTextInterception:
 
     def test_partial_tag_across_three_chunks(self, orchestrator):
         """Tag content spread across three chunks."""
-        with patch.object(orchestrator, "_dispatch_to_claude") as mock_dispatch:
+        with patch.object(orchestrator, "_dispatch_to_airy") as mock_dispatch:
             orchestrator._intercept_text("assistant", "<airy>first ")
             assert orchestrator._in_tag is True
 
@@ -175,7 +190,7 @@ class TestTextInterception:
 
     def test_empty_tag_not_dispatched(self, orchestrator):
         """An empty <airy></airy> tag should not dispatch."""
-        with patch.object(orchestrator, "_dispatch_to_claude") as mock_dispatch:
+        with patch.object(orchestrator, "_dispatch_to_airy") as mock_dispatch:
             orchestrator._intercept_text("assistant", "<airy></airy>")
             mock_dispatch.assert_not_called()
 
@@ -188,24 +203,33 @@ class TestTextInterception:
         assert orchestrator._tag_buffer == ""
 
 
-# --- Claude Dispatch Tests ---
+# --- Discord Dispatch Tests ---
 
 
-class TestClaudeDispatch:
-    """Test dispatching prompts to Claude."""
+class TestDiscordDispatch:
+    """Test dispatching prompts to Airy via Discord."""
 
     @pytest.mark.asyncio
     async def test_successful_dispatch(self, orchestrator, mock_session):
-        """Successful Claude call should inject response and reconnect."""
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="The weather is sunny.")]
+        """Successful Discord dispatch should inject response and reconnect."""
+        # Mock HTTP session
+        mock_http = AsyncMock()
 
-        with patch.object(orchestrator, "_get_claude_client") as mock_client_fn:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client_fn.return_value = mock_client
+        # Mock webhook post
+        webhook_resp = _mock_http_response(200, {"id": "msg_123"})
+        # Mock thread poll (Airy's reply found on first check)
+        thread_resp = _mock_http_response(200, [
+            {"author": {"id": "111222333"}, "content": "The weather is sunny."}
+        ])
 
-            await orchestrator._call_claude_and_inject("what is the weather")
+        mock_http.get = MagicMock(return_value=thread_resp)
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.closed = False
+
+        orchestrator._http = mock_http
+        orchestrator._bot_user_id = "111222333"  # Skip resolution
+
+        await orchestrator._post_and_poll("what is the weather")
 
         # Should have added two history entries
         assert len(mock_session._history) == 2
@@ -221,43 +245,45 @@ class TestClaudeDispatch:
         assert orchestrator._dispatches[0].response == "The weather is sunny."
 
     @pytest.mark.asyncio
-    async def test_dispatch_timeout(self, orchestrator, mock_session):
-        """Timeout should be recorded as a failed dispatch."""
-        orchestrator._config.dispatch_timeout = 0.1
+    async def test_webhook_post_failure(self, orchestrator, mock_session):
+        """Failed webhook post should be recorded as a failed dispatch."""
+        mock_http = AsyncMock()
+        webhook_resp = _mock_http_response(500, text_data="Internal Server Error")
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.closed = False
 
-        with patch.object(orchestrator, "_get_claude_client") as mock_client_fn:
-            mock_client = AsyncMock()
+        orchestrator._http = mock_http
+        orchestrator._bot_user_id = "111222333"
 
-            async def slow_create(**kwargs):
-                await asyncio.sleep(10)
-
-            mock_client.messages.create = slow_create
-            mock_client_fn.return_value = mock_client
-
-            await orchestrator._call_claude_and_inject("slow question")
+        await orchestrator._post_and_poll("test prompt")
 
         assert len(orchestrator._dispatches) == 1
         assert orchestrator._dispatches[0].success is False
-        assert "Timeout" in orchestrator._dispatches[0].error
-
-        # Should NOT have reconnected on failure
+        assert "Webhook post failed" in orchestrator._dispatches[0].error
         mock_session.reconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dispatch_error(self, orchestrator, mock_session):
-        """API error should be recorded as a failed dispatch."""
-        with patch.object(orchestrator, "_get_claude_client") as mock_client_fn:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(
-                side_effect=Exception("API error")
-            )
-            mock_client_fn.return_value = mock_client
+    async def test_dispatch_timeout(self, orchestrator, mock_session):
+        """Timeout should be recorded as a failed dispatch."""
+        orchestrator._config.dispatch_timeout = 0.2
+        orchestrator._config.poll_interval = 0.1
 
-            await orchestrator._call_claude_and_inject("broken question")
+        mock_http = AsyncMock()
+        webhook_resp = _mock_http_response(200, {"id": "msg_123"})
+        # Thread returns empty (no reply) and channel returns empty
+        empty_resp = _mock_http_response(200, [])
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.get = MagicMock(return_value=empty_resp)
+        mock_http.closed = False
+
+        orchestrator._http = mock_http
+        orchestrator._bot_user_id = "111222333"
+
+        await orchestrator._post_and_poll("slow question")
 
         assert len(orchestrator._dispatches) == 1
         assert orchestrator._dispatches[0].success is False
-        assert "API error" in orchestrator._dispatches[0].error
+        assert "No reply" in orchestrator._dispatches[0].error
         mock_session.reconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -266,26 +292,97 @@ class TestClaudeDispatch:
         callback_results = []
         orchestrator._on_airy_response = lambda r: callback_results.append(r)
 
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="Result")]
+        mock_http = AsyncMock()
+        webhook_resp = _mock_http_response(200, {"id": "msg_123"})
+        thread_resp = _mock_http_response(200, [
+            {"author": {"id": "111222333"}, "content": "Result"}
+        ])
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.get = MagicMock(return_value=thread_resp)
+        mock_http.closed = False
 
-        with patch.object(orchestrator, "_get_claude_client") as mock_client_fn:
-            mock_client = AsyncMock()
-            mock_client.messages.create = AsyncMock(return_value=mock_response)
-            mock_client_fn.return_value = mock_client
+        orchestrator._http = mock_http
+        orchestrator._bot_user_id = "111222333"
 
-            await orchestrator._call_claude_and_inject("test")
+        await orchestrator._post_and_poll("test")
 
         assert len(callback_results) == 1
         assert callback_results[0].success is True
         assert callback_results[0].response == "Result"
+
+    @pytest.mark.asyncio
+    async def test_channel_fallback(self, orchestrator, mock_session):
+        """If no thread exists, should check channel messages."""
+        mock_http = AsyncMock()
+        webhook_resp = _mock_http_response(200, {"id": "msg_123"})
+        # Thread 404 (no thread exists)
+        thread_resp = _mock_http_response(404)
+        # Channel has the reply
+        channel_resp = _mock_http_response(200, [
+            {"author": {"id": "111222333"}, "content": "Found in channel"}
+        ])
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.get = MagicMock(side_effect=[thread_resp, channel_resp])
+        mock_http.closed = False
+
+        orchestrator._http = mock_http
+        orchestrator._bot_user_id = "111222333"
+
+        await orchestrator._post_and_poll("find this")
+
+        assert len(orchestrator._dispatches) == 1
+        assert orchestrator._dispatches[0].success is True
+        assert orchestrator._dispatches[0].response == "Found in channel"
+
+    @pytest.mark.asyncio
+    async def test_dispatch_not_configured(self, mock_session):
+        """Dispatch without config should fail immediately."""
+        orch = AiryOrchestrator(
+            session=mock_session,
+            config=OrchestratorConfig(
+                webhook_url="",
+                bot_token="",
+                channel_id="",
+            ),
+        )
+        orch._dispatch_to_airy("test prompt")
+
+        assert len(orch._dispatches) == 1
+        assert orch._dispatches[0].success is False
+        assert "config incomplete" in orch._dispatches[0].error
+
+
+# --- Webhook Post Tests ---
+
+
+class TestWebhookPost:
+    """Test posting to Discord webhook."""
+
+    @pytest.mark.asyncio
+    async def test_webhook_post_content(self, orchestrator):
+        """Webhook post should include the prompt and Nova Voice username."""
+        mock_http = AsyncMock()
+        webhook_resp = _mock_http_response(200, {"id": "msg_456"})
+        mock_http.post = MagicMock(return_value=webhook_resp)
+        mock_http.closed = False
+        orchestrator._http = mock_http
+
+        result = await orchestrator._post_webhook(mock_http, "search for weather")
+
+        assert result == "msg_456"
+        # Verify the webhook was called with the right payload
+        mock_http.post.assert_called_once()
+        call_args = mock_http.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["content"] == "search for weather"
+        assert payload["username"] == "Nova Voice"
 
 
 # --- Response Injection Tests ---
 
 
 class TestResponseInjection:
-    """Test injecting Claude's response back into Nova."""
+    """Test injecting Airy's response back into Nova."""
 
     @pytest.mark.asyncio
     async def test_injection_adds_history(self, orchestrator, mock_session):
@@ -303,6 +400,48 @@ class TestResponseInjection:
         """Injection should force a session reconnect."""
         await orchestrator._inject_response("test", "result")
         mock_session.reconnect.assert_awaited_once()
+
+
+# --- Config Tests ---
+
+
+class TestConfig:
+    """Test OrchestratorConfig."""
+
+    def test_env_var_fallback(self):
+        """Config should fall back to environment variables."""
+        with patch.dict("os.environ", {
+            "NOVA_WEBHOOK_URL": "https://discord.com/api/webhooks/test",
+            "DISCORD_TOKEN": "env-token",
+            "NOVA_CHANNEL_ID": "env-channel",
+        }):
+            config = OrchestratorConfig()
+            assert config.webhook_url == "https://discord.com/api/webhooks/test"
+            assert config.bot_token == "env-token"
+            assert config.channel_id == "env-channel"
+            assert config.is_configured is True
+
+    def test_explicit_values_override_env(self):
+        """Explicit constructor values should override env vars."""
+        with patch.dict("os.environ", {
+            "NOVA_WEBHOOK_URL": "from-env",
+        }):
+            config = OrchestratorConfig(
+                webhook_url="explicit",
+                bot_token="tok",
+                channel_id="ch",
+            )
+            assert config.webhook_url == "explicit"
+
+    def test_not_configured_when_missing(self):
+        """is_configured should be False when any value is missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            config = OrchestratorConfig(
+                webhook_url="",
+                bot_token="",
+                channel_id="",
+            )
+            assert config.is_configured is False
 
 
 # --- System Prompt Tests ---
@@ -369,3 +508,30 @@ class TestOrchestratorWiring:
             DispatchResult(prompt="test", response="ok", latency_ms=100, success=True)
         )
         assert orchestrator.dispatch_count == 1
+
+
+# --- Bot User ID Resolution Tests ---
+
+
+class TestBotUserResolution:
+    """Test resolving the bot's user ID from the token."""
+
+    @pytest.mark.asyncio
+    async def test_resolves_from_api(self, orchestrator):
+        """Should resolve bot user ID from /users/@me."""
+        mock_http = AsyncMock()
+        user_resp = _mock_http_response(200, {"id": "bot_12345"})
+        mock_http.get = MagicMock(return_value=user_resp)
+        mock_http.closed = False
+        orchestrator._http = mock_http
+
+        user_id = await orchestrator._resolve_bot_user_id()
+        assert user_id == "bot_12345"
+        assert orchestrator._bot_user_id == "bot_12345"
+
+    @pytest.mark.asyncio
+    async def test_caches_user_id(self, orchestrator):
+        """Should cache the bot user ID after first resolution."""
+        orchestrator._bot_user_id = "cached_id"
+        result = await orchestrator._resolve_bot_user_id()
+        assert result == "cached_id"
