@@ -26,6 +26,7 @@ import time
 
 from nova_sonic.agent import NovaSonicVoiceAgent
 from nova_sonic.audio import detect_mic
+from nova_sonic.orchestrator import AiryOrchestrator, OrchestratorConfig, build_nova_system_prompt
 from nova_sonic.session import NovaSonicConfig
 
 # Configure logging
@@ -56,6 +57,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Max conversation duration in seconds (0=unlimited, Ctrl+C to stop)",
+    )
+    parser.add_argument(
+        "--airy",
+        action="store_true",
+        help="Enable Airy orchestrator (Nova calls Claude for deeper cognition)",
+    )
+    parser.add_argument(
+        "--airy-model",
+        default="claude-sonnet-4-20250514",
+        help="Claude model for Airy dispatch (default: claude-sonnet-4-20250514)",
     )
     parser.add_argument(
         "--debug",
@@ -99,12 +110,22 @@ class ConversationDisplay:
             print(f"\n  [{elapsed:5.0f}s] Nova: ", end="", flush=True)
         print(text, end="", flush=True)
 
+    def on_airy_dispatch(self, result) -> None:
+        """Show when Nova calls Airy and gets a response."""
+        elapsed = time.time() - self._start_time
+        if result.success:
+            print(f"\n  [{elapsed:5.0f}s] [Airy] asked: {result.prompt[:80]}")
+            print(f"  [{elapsed:5.0f}s] [Airy] responded ({result.latency_ms:.0f}ms): {result.response[:100]}")
+        else:
+            print(f"\n  [{elapsed:5.0f}s] [Airy] failed: {result.error}")
+        self._current_role = None
+
     def on_reconnect(self) -> None:
         elapsed = time.time() - self._start_time
         print(f"\n  [{elapsed:5.0f}s] [session renewed, conversation continues]")
         self._current_role = None
 
-    def summary(self, agent: NovaSonicVoiceAgent) -> None:
+    def summary(self, agent: NovaSonicVoiceAgent, orchestrator=None) -> None:
         elapsed = time.time() - self._start_time
         session = agent.session
         metrics = session.metrics if session else None
@@ -121,6 +142,18 @@ class ConversationDisplay:
             print(f"  Audio sent:   {metrics.audio_chunks_sent} chunks")
             print(f"  Audio recv:   {metrics.audio_chunks_received} chunks")
             print(f"  Events:       {metrics.events_received}")
+        if orchestrator:
+            dispatches = orchestrator.dispatches
+            succeeded = sum(1 for d in dispatches if d.success)
+            failed = len(dispatches) - succeeded
+            avg_latency = (
+                sum(d.latency_ms for d in dispatches if d.success) / succeeded
+                if succeeded
+                else 0
+            )
+            print(f"  Airy calls:   {len(dispatches)} ({succeeded} ok, {failed} failed)")
+            if succeeded:
+                print(f"  Avg latency:  {avg_latency:.0f}ms")
         if history:
             print(f"  Transcript:   {len(history)} entries")
             print()
@@ -149,7 +182,14 @@ async def run(args: argparse.Namespace) -> None:
         voice_id=args.voice,
         input_device_index=mic_index,
     )
-    if args.system:
+
+    # If Airy orchestrator is enabled, use the Nova-calls-Airy system prompt
+    if args.airy:
+        config.system_prompt = build_nova_system_prompt(
+            base_personality=args.system or "",
+        )
+        logger.info("Airy orchestrator enabled (model=%s)", args.airy_model)
+    elif args.system:
         config.system_prompt = args.system
 
     # Create agent
@@ -174,6 +214,20 @@ async def run(args: argparse.Namespace) -> None:
     display.start()
     await agent.start()
 
+    # Wire up Airy orchestrator after session exists
+    orchestrator = None
+    if args.airy and agent.session:
+        orchestrator = AiryOrchestrator(
+            session=agent.session,
+            config=OrchestratorConfig(
+                claude_model=args.airy_model,
+                dispatch_timeout=15.0,
+            ),
+            on_airy_response=display.on_airy_dispatch,
+            on_text=display.on_assistant_text,
+        )
+        logger.info("Airy orchestrator wired into session")
+
     # Wire up reconnect display
     if agent.session:
         original_on_reconnect = agent.session._on_reconnect
@@ -195,8 +249,14 @@ async def run(args: argparse.Namespace) -> None:
         await stop_event.wait()
 
     # Shutdown
+    if orchestrator:
+        orchestrator.stop()
+        logger.info(
+            "Airy orchestrator stopped (%d dispatches)",
+            orchestrator.dispatch_count,
+        )
     await agent.stop()
-    display.summary(agent)
+    display.summary(agent, orchestrator=orchestrator)
 
 
 def main() -> None:
