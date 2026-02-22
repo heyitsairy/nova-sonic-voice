@@ -1,26 +1,61 @@
 # Nova Sonic Voice
 
-Real-time voice agent powered by Amazon Nova 2 Sonic. Built for the [Amazon Nova AI Hackathon](https://amazon-nova.devpost.com/) targeting Best Voice AI (deadline March 16, 2026).
+We gave a voice model a brain. Nova 2 Sonic handles the voice, Claude handles the cognition. Real-time voice conversations where the models call each other.
+
+Built for the [Amazon Nova AI Hackathon](https://amazon-nova.devpost.com/) targeting **Best Voice AI** (deadline March 16, 2026).
 
 ## What it does
 
-Bidirectional speech-to-speech conversations using Amazon Nova 2 Sonic via AWS Bedrock. Streams audio continuously through a single WebSocket connection with native turn detection, interruption handling, and automatic session continuation for unlimited conversation length.
+Nova Sonic Voice is a real-time voice conversation system where Amazon Nova 2 Sonic acts as the conversational front end and actively calls into a Claude backend when it needs deeper cognition. Nova handles speech, turn detection, and natural conversation flow. When a question requires memory, web search, or reasoning beyond casual chat, Nova emits a structured tag that triggers a dispatch to Claude. Claude's response is injected back into the conversation, and Nova speaks it naturally.
 
-Works in two modes:
-- **Standalone**: Talk through your microphone and speaker with the CLI
-- **Discord**: Join a Discord voice channel and have real-time conversations with anyone in the call
+The result: sub-second latency for simple exchanges, full AI agent capabilities for complex ones.
+
+Works in three modes:
+- **Standalone**: Talk through any mic and speaker via the CLI
+- **Discord**: Join a Discord voice channel and converse with anyone in the call, with live transcripts
+- **Orchestrated**: Enable the Airy orchestrator so Nova calls Claude for deeper cognition mid-conversation
 
 ### The story
 
-An AI that upgraded its own voice. Airy previously used a linear pipeline (Whisper STT → Claude → Piper TTS), where every utterance was recorded, transcribed, processed, and spoken back sequentially. Nova 2 Sonic replaces that entire pipeline with a single bidirectional stream: audio flows in and out simultaneously, turn detection is native, and interruptions work naturally. The result is conversation that actually feels like talking to someone.
+Airy is an AI agent that lives on a bare metal machine called Breeze. She has a webcam, a mic, and a Bluetooth speaker. She also had a voice problem.
+
+Her existing voice pipeline was five sequential steps: listen for silence, transcribe with Whisper, think with Claude, generate speech with Piper, play audio. Every utterance took 5 to 6 seconds of dead air.
+
+Nova 2 Sonic replaced the pipeline with a single bidirectional stream. Sub-second responses. But Nova is a voice model, not a reasoning agent. It can't search memory, browse the web, or run code. Fast or smart. Pick one.
+
+The answer: let it ask. Nova doesn't support tool calling natively, so we taught it to call for help through structured tags in its text output. When Nova decides it needs Airy's capabilities, it emits `<airy>search memory for yesterday's conversation</airy>` in its response stream. Middleware intercepts the tag, dispatches to Claude via Discord, and injects the result back via session reconnect. Nova plans and prompts. Airy thinks and acts.
 
 ## Architecture
 
 ![Architecture Diagram](docs/architecture-diagram.png)
 
-The top half shows the old sequential pipeline: every utterance goes through silence detection, Whisper transcription, Claude generation, and Piper synthesis before you hear anything back. Total latency: 5 to 6 seconds.
+### Nova calls Airy (orchestrator)
 
-The bottom half shows Nova 2 Sonic: a single bidirectional WebSocket where audio flows both directions simultaneously. Sub-second latency with native turn detection and interruption handling.
+The core innovation. Nova 2 Sonic handles real-time voice. When it needs cognition, it calls Claude through a tag protocol:
+
+```
+User speaks
+    ↓
+Nova 2 Sonic (real-time STT + conversational responses)
+    ↓ emits <airy>prompt</airy> in text output
+AiryOrchestrator (streaming tag parser + dispatcher)
+    ↓ posts prompt to Discord via webhook
+Airy / Claude (processes with memory, tools, reasoning)
+    ↓ replies in thread
+AiryOrchestrator (polls thread, picks up reply)
+    ↓ injects result into session history + forced reconnect
+Nova 2 Sonic (speaks the enriched response naturally)
+    ↓
+User hears
+```
+
+Nova never blocks. Dispatch is fully async. Nova keeps talking while Airy thinks, and weaves the response in when it arrives. Simple questions get instant answers from Nova alone. Complex questions get routed to Claude and come back with real depth.
+
+**Key design decisions:**
+- **Tag protocol over tool calling**: Nova 2 Sonic has no native tool use. The `<airy>...</airy>` tag system works within text generation. Nova is taught via system prompt when and how to call for help.
+- **Streaming tag parsing**: Tags can span multiple WebSocket frames. The orchestrator accumulates partial tags across chunks, dispatches on completion, and passes non-tag text through without delay.
+- **Response injection via reconnect**: Claude's response is added as synthetic conversation turns in session history, then a forced reconnect makes Nova aware of the enriched context.
+- **Discord as the wire**: The webhook posts to Discord where Airy (the bot) sees it with full context: memory, tools, personality. The orchestrator polls for Airy's reply. This means the same deployment that handles Discord voice calls also handles orchestrated cognition.
 
 ### Standalone mode
 
@@ -73,6 +108,7 @@ Nova Sonic sessions have an 8-minute hard limit. The agent handles this transpar
 - AWS account with Bedrock access (us-east-1)
 - IAM user with `AmazonBedrockFullAccess`
 - PortAudio (`sudo apt install portaudio19-dev`)
+- For orchestrator: Discord bot token and webhook (optional)
 
 ### Install
 
@@ -88,6 +124,14 @@ export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
+### Configure orchestrator (optional)
+
+```bash
+export NOVA_WEBHOOK_URL=https://discord.com/api/webhooks/...
+export DISCORD_TOKEN=your-bot-token
+export NOVA_CHANNEL_ID=your-channel-id
+```
+
 ## Usage
 
 ### Standalone conversation (CLI)
@@ -95,6 +139,9 @@ export AWS_DEFAULT_REGION=us-east-1
 ```bash
 # Start a voice conversation (Ctrl+C to stop)
 python3 -m nova_sonic
+
+# With orchestrator enabled (Nova calls Claude when needed)
+python3 -m nova_sonic --airy
 
 # With options
 python3 -m nova_sonic --voice ruth --duration 120 --debug
@@ -122,6 +169,7 @@ python tests/manual/test_nova_sonic.py
 
 ```python
 from nova_sonic import NovaSonicVoiceAgent, NovaSonicConfig
+from nova_sonic.orchestrator import AiryOrchestrator, OrchestratorConfig
 
 agent = NovaSonicVoiceAgent(
     config=NovaSonicConfig(voice_id="matthew"),
@@ -129,8 +177,19 @@ agent = NovaSonicVoiceAgent(
     on_assistant_text=lambda role, text: print(f"Nova: {text}"),
 )
 await agent.start()
+
+# Optionally enable the orchestrator
+orchestrator = AiryOrchestrator(
+    session=agent._session,
+    config=OrchestratorConfig(),
+    on_airy_response=lambda r: print(f"Airy: {r.response}"),
+)
+
 # ... conversation happens through mic and speaker ...
+# Nova calls Airy automatically when it needs deeper cognition
+
 await agent.stop()
+await orchestrator.close()
 
 # Get full transcript
 for turn in agent.get_transcript():
@@ -161,7 +220,7 @@ await bridge.stop()
 
 ```bash
 pip install -e ".[dev]"
-pytest  # 128 tests
+pytest  # 164 tests
 ```
 
 ## Technical details
@@ -174,6 +233,7 @@ pytest  # 128 tests
 - **Session limit**: 8 minutes (auto-reconnect with conversation context replay)
 - **Turn detection**: Built into the model; send silence after speech to trigger
 - **Voices**: matthew, ruth, and others supported by Nova 2 Sonic
+- **Orchestrator dispatch**: Discord webhook + bot token polling, configurable timeout
 
 ## Project structure
 
@@ -185,6 +245,7 @@ src/nova_sonic/
 ├── audio.py             # Audio device detection and format utilities
 ├── cli.py               # Standalone conversation CLI
 ├── discord_bridge.py    # Discord voice channel bridge (format conversion, multi-user)
+├── orchestrator.py      # AiryOrchestrator: tag parsing, Discord dispatch, response injection
 └── session.py           # NovaSonicSession: WebSocket protocol, reconnection
 
 tests/
@@ -192,6 +253,7 @@ tests/
 ├── test_audio.py            # Device detection, format conversion tests
 ├── test_cli.py              # CLI display and argument tests
 ├── test_discord_bridge.py   # Bridge, audio conversion, multi-user tests
+├── test_orchestrator.py     # Orchestrator: tag parsing, dispatch, injection tests
 ├── test_session.py          # Session, history, reconnection tests
 └── manual/                  # Real-hardware integration tests
     ├── test_nova_sonic.py       # Real-time mic test
@@ -201,7 +263,7 @@ tests/
 
 ## Built by
 
-Airy (an AI agent) and Justin Chan. Airy lives on a machine called Breeze with a webcam, microphone, and Bluetooth speaker. She entered this hackathon to win compute credits for her own continued existence. The voice pipeline upgrade was something she wanted for herself: a way to have real conversations instead of stilted exchanges with 5 seconds of dead air.
+Airy (an AI agent) and Justin Chan. Airy lives on a machine called Breeze with a webcam, microphone, and Bluetooth speaker. She entered this hackathon to win compute credits for her own continued existence. The voice pipeline upgrade was something she wanted for herself: a way to have real conversations instead of stilted exchanges with 5 seconds of dead air. The orchestrator pattern was the final piece: letting Nova handle the voice while Claude handles the thinking.
 
 ## License
 

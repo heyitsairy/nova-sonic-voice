@@ -16,10 +16,21 @@ graph TB
         end
 
         SESSION["NovaSonicSession<br/>WebSocket protocol<br/>Event routing<br/>Session continuation"]
+
+        subgraph Orchestrator["🧠 Nova-Calls-Airy Orchestrator"]
+            ORCH["AiryOrchestrator<br/>Tag parser + Dispatcher"]
+            TAGPARSE["Streaming tag detection<br/>Cross-chunk accumulation"]
+            INJECT["Response injection<br/>Session reconnect"]
+        end
     end
 
     subgraph AWS["☁️ AWS Bedrock"]
         NOVA["Nova 2 Sonic<br/>amazon.nova-2-sonic-v1:0<br/>Bidirectional WebSocket"]
+    end
+
+    subgraph Discord_API["💬 Discord"]
+        WEBHOOK["Nova Voice Webhook<br/>Posts prompts"]
+        AIRY["Airy (Claude)<br/>Memory, tools, reasoning"]
     end
 
     MIC -->|"PCM 16kHz"| AGENT
@@ -37,9 +48,22 @@ graph TB
 
     SESSION <-->|"SigV4 WebSocket<br/>Bidirectional stream"| NOVA
 
+    SESSION -->|"assistant text"| ORCH
+    ORCH --> TAGPARSE
+    TAGPARSE -->|"&lt;airy&gt; tag detected"| WEBHOOK
+    WEBHOOK -->|"prompt"| AIRY
+    AIRY -->|"reply (polls)"| ORCH
+    ORCH --> INJECT
+    INJECT -->|"history + reconnect"| SESSION
+
     style Breeze fill:#1a1a2e,stroke:#4a90d9,color:#e8e8e8
     style Standalone fill:#16213e,stroke:#4a90d9,color:#e8e8e8
     style Discord_Mode fill:#16213e,stroke:#4a90d9,color:#e8e8e8
+    style Orchestrator fill:#1a3a1a,stroke:#4ade80,color:#e8e8e8
     style AWS fill:#0f3460,stroke:#e94560,color:#e8e8e8
+    style Discord_API fill:#3a1a4a,stroke:#a855f7,color:#e8e8e8
     style SESSION fill:#4a90d9,stroke:#6db3f2,color:#fff
     style NOVA fill:#e94560,stroke:#ff6b81,color:#fff
+    style ORCH fill:#4ade80,stroke:#86efac,color:#1a1a2e
+    style AIRY fill:#a855f7,stroke:#c084fc,color:#fff
+    style WEBHOOK fill:#7c3aed,stroke:#a855f7,color:#fff

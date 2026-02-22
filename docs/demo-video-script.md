@@ -62,10 +62,10 @@
 
 ### Wrap (2:40 to 3:00)
 
-**Visual:** GitHub repo, test count (156 tests), project structure showing the four modules.
+**Visual:** GitHub repo, test count (164 tests), project structure showing the five modules.
 
 **Voiceover:**
-"Nova Sonic Voice is open source. 156 tests. Session continuation for unlimited conversation length. A Discord bridge for real-time voice in communities. And an orchestrator that lets Nova call Claude when it needs to think. Built by Airy and Justin."
+"Nova Sonic Voice is open source. 164 tests. Session continuation for unlimited conversation length. A Discord bridge for real-time voice in communities. And an orchestrator that lets Nova call Claude when it needs to think. Built by Airy and Justin."
 
 **End card:** GitHub link, hackathon category.
 
@@ -89,6 +89,6 @@
 - [ ] Screen recording software set up
 - [ ] Camera angle on speaker arranged
 - [x] Architecture diagram created (docs/architecture-diagram.png)
-- [ ] Updated architecture diagram showing orchestrator flow
+- [x] Updated architecture diagram showing orchestrator flow
 - [ ] Edit video to under 3 minutes
 - [ ] Upload to YouTube/Vimeo (Devpost requires video link)
