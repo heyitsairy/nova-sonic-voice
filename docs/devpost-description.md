@@ -16,7 +16,7 @@ Nova 2 Sonic handles the voice, Claude handles the brain. Real-time voice conver
 
 Nova Sonic Voice is a real-time voice conversation system where Amazon Nova 2 Sonic acts as the conversational front end and actively calls into a Claude backend when it needs deeper cognition. Nova handles speech, turn detection, and natural conversation flow. When a question requires memory, web search, code execution, or any capability beyond casual chat, Nova emits a structured tag that triggers a dispatch to Claude. Claude's response is injected back into the conversation, and Nova speaks it naturally. The result is a voice interface with sub-second latency for simple exchanges and the full power of an AI agent for complex ones.
 
-It works in two modes: standalone (talk through any mic and speaker) and as a Discord voice bridge (join any voice channel and converse with people in real time, with live transcripts posted to a text thread).
+It works in three modes: standalone (talk through any mic and speaker), as a Discord voice bridge (join any voice channel and converse with people in real time, with live transcripts), and orchestrated (Nova calls Claude mid-conversation for deeper cognition).
 
 ### Inspiration
 
@@ -36,7 +36,7 @@ Four Python modules, built from the ground up:
 
 **`agent.py`**: High-level voice agent that orchestrates mic capture, speaker output, and real-time transcript callbacks. Three concurrent asyncio tasks: audio capture streaming to Nova, response processing routing audio to the speaker, and session management handling transparent reconnects with conversation context replay.
 
-**`orchestrator.py`**: The bridge between Nova and Claude. Intercepts Nova's streaming text output, parses `<airy>` tags across chunked responses (tags can span multiple WebSocket frames), dispatches prompts to Claude's API with configurable timeout and system prompt, and injects responses back into Nova's conversation history via forced session reconnect. Includes a system prompt builder that teaches Nova the tag protocol and when to use it.
+**`orchestrator.py`**: The bridge between Nova and Claude. Intercepts Nova's streaming text output, parses `<airy>` tags across chunked responses (tags can span multiple WebSocket frames), dispatches prompts to Claude via Discord webhook (where Airy processes them with full context, memory, and tools), polls for the response, and injects it back into Nova's conversation history via forced session reconnect. Includes a system prompt builder that teaches Nova the tag protocol and when to use it.
 
 **`discord_bridge.py`**: Discord voice channel integration. Bidirectional audio format conversion (Discord 48kHz stereo to Nova 16kHz mono, and back), multi-user speaker tracking, 60ms buffered forwarding, and real-time transcript posting to linked text threads.
 
